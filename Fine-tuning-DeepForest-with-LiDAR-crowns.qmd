@@ -1,0 +1,319 @@
+---
+title: "Fine-tuning DeepForest with LiDAR-derived crowns for individual tree detection in 0.6 m NAIP imagery, and the effect of canopy surface complexity on detection accuracy in eastern Mount Rainier National Park"
+author: "Lavran Pagano"
+abstract: |
+  DeepForest, a deep learning model commonly used to identify tree crowns from RGB imagery, was applied to 0.6 m National Agriculture Imagery Program (NAIP) imagery before and after being specifically trained on tree crowns segmented from airborne LiDAR. The LiDAR-trained and out-of-the-box DeepForest models were evaluated with five-fold spatial cross-validation against LiDAR-derived reference tree crowns. When a tree was counted as detected if its LiDAR-derived treetop fell within a predicted box, fine-tuning raised F1 from 0.42 to 0.75 (precision 0.48 to 0.76; recall 0.37 to 0.74); under the stricter object-detection standard, which requires the predicted box to overlap the reference crown's bounding box with an intersection over union of at least 0.5, F1 rose from 0.06 to 0.44. Detection accuracy was then related to canopy surface complexity (rumple) in the 30 m cell containing each tree. Averaged across all trees, the fine-tuned model's accuracy increased with rumple, from an F1 of 0.65 in the smoothest fifth of trees to 0.80 in the roughest, but this pattern reflected the larger crowns found in rougher canopy. In tree-level logistic regressions that held crown area and tree height constant, each standard-deviation increase in rumple reduced the odds of detection (odds ratio 0.83 for the fine-tuned model and 0.81 for the released model). The decline in recall was largest for small crowns, was consistent across five criteria for matching predictions to reference trees, and was not reduced by fine-tuning. These results show that LiDAR-derived crowns can assist in improving the prediction accuracy of DeepForest at NAIP resolution, and that accuracy assessments relating detection to canopy structure need to account for crown size, which otherwise reverses the apparent effect of canopy complexity.
+
+format:
+  html:
+    toc: false
+    embed-resources: true
+    number-sections: false
+    html-math-method: mathjax
+    theme: cosmo
+    fig-width: 9
+    fig-height: 6
+jupyter: python3
+---
+
+```{python}
+#| echo: false
+#| label: setup
+from pathlib import Path
+import numpy as np, pandas as pd, geopandas as gpd, rasterio
+import matplotlib.pyplot as plt
+import matplotlib.patheffects as pe
+from rasterio.enums import Resampling
+plt.rcParams.update({"figure.facecolor": "white", "savefig.facecolor": "white", "axes.facecolor": "white"})
+project_dir = next((p for p in [Path("."), Path(".."), Path("../Tree_detection")]
+                    if (p / "deepforest_predictions_cv").exists()), Path("."))   # data folder: here, one up, or next door
+naip_path   = project_dir / "Rainier_NAIP_2019/Mount_Rainier_NAIP_2019_RGB.tif"
+folds_path  = project_dir / "deepforest_training_data_cv/tile_folds.shp"
+cv_dir      = project_dir / "deepforest_predictions_cv"          # 04_predict_tiles.py
+rumple_dir  = project_dir / "rumple_analysis_cv"                 # 05_rumple_analysis.py
+FT, DL = "#2a78d6", "#eb6834"                                    # fine-tuned, as downloaded
+INK, MUTED, GRID = "#2b2b2b", "#6b6b6b", "#e6e6e6"
+```
+
+# Introduction
+
+DeepForest is an open-source deep learning model developed on 10 cm imagery from the National Ecological Observatory Network (NEON); its released tree model was first pretrained on over 30 million crowns delineated automatically from airborne LiDAR at 22 forests before being further refined with 10,000 hand-annotated crowns from six forests ([Weinstein et al. 2019](https://doi.org/10.3390/rs11111309); [Weinstein et al. 2020](https://doi.org/10.1111/2041-210X.13472)). Unfortunately, imagery at 10 cm resolution is rarely publicly available over large areas. In contrast, the U.S. Department of Agriculture’s National Agriculture Imagery Program (NAIP) provides 0.6 m imagery across the contiguous United States ([U.S. Department of Agriculture n.d.](https://catalog.data.gov/dataset/national-agriculture-imagery-program-naip-imagery)). At this resolution, however, a 100 m² crown is fewer than 20 pixels across, and detectors trained on finer imagery may not transfer. [Ventura et al. (2024)](https://doi.org/10.1016/j.jag.2024.103848) demonstrated the application of NAIP for individual tree detection in urban environments. They identified small trees and dense groups of overlapping crowns as common sources of error but did not quantify how errors varied with these conditions ([Ventura et al. 2024](https://doi.org/10.1016/j.jag.2024.103848)). Whether LiDAR-derived crowns can be used to train a detector on NAIP in closed conifer forest, and how accurate such a detector is, has not been established.
+
+Detection accuracy is also unlikely to be uniform across a landscape. Comparisons of LiDAR-based individual tree detection methods have repeatedly found that tall and dominant trees are detected reliably while suppressed trees and trees beneath taller neighbors are often missed ([Kaartinen et al. 2012](https://doi.org/10.3390/rs4040950); [Eysn et al. 2015](https://doi.org/10.3390/f6051721); Jeronimo 2015), and that forest structure, including tree density and clustering, strongly affects the performance of every algorithm tested ([Vauhkonen et al. 2012](https://doi.org/10.1093/forestry/cpr051)). Image-based deep-learning detectors show the same dependence on tree size; in tropical forest, detectree2 reached an F1 of 0.64 overall and 0.74 for the tallest trees ([Ball et al. 2023](https://doi.org/10.1002/rse2.332)). In tree-level models, [Hastings et al. (2020)](https://doi.org/10.3390/rs12020309) found that the odds of a correct LiDAR crown delineation in a mixed temperate forest decreased with canopy surface complexity for one of the five delineation methods they compared. However, the association was marginal across 15 plots.
+
+Rumple, the ratio of canopy surface area to the projected ground area, is a widely used LiDAR measure of canopy surface complexity ([Parker et al. 2004](https://doi.org/10.1007/s10021-004-0136-5); [Kane et al. 2010a](https://doi.org/10.1139/X10-024)). Rumple tends to increase with tree height and therefore needs to be interpreted alongside canopy stature ([Kane et al. 2010b](https://doi.org/10.1139/X10-064)). In eastern Mount Rainier, rumple and 95th-percentile canopy height are strongly correlated (Pearson $r = 0.93$ across 30 m cells; companion analysis). Because larger crowns are easier to detect, any relationship between rumple and detection accuracy is confounded by crown size: rough canopy could appear easier simply because it contains bigger trees, even if complexity itself makes trees of a given size harder to detect. Accuracy assessments that report results by stratum ([Yin and Wang 2016](https://doi.org/10.1080/01431161.2016.1214302)) and tree-level models that include tree size ([Hastings et al. 2020](https://doi.org/10.3390/rs12020309)) offer ways to separate these effects.
+
+This study aims to examine whether fine-tuning DeepForest with LiDAR-derived tree crowns improves tree detection when using 0.6 m NAIP imagery; whether detection accuracy is related to canopy surface complexity; whether that relationship remains once crown size and tree height are held constant; and, finally, whether fine-tuning changes how canopy complexity affects detection.
+
+# Methods
+
+**Study area and data**
+
+The study area is the 7.4 × 16.7 km airborne LiDAR footprint on the eastern edge of Mount Rainier National Park, Washington. USGS WA Eastern Cascades 2019 B19 LiDAR acquisition (USGS Quality Level 1; [U.S. Geological Survey project report](https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/metadata/WA_EasternCascades_2019_B19/USGS_WA_EasternCascades_2019_B19_Project_Report.pdf)) was used to produce a 1 m pit-free canopy height model (CHM) inspired by the approach used in [Khosravipour et al. (2014)](https://doi.org/10.14358/PERS.80.9.863), as well as a 30 m rumple raster computed from that CHM. Imagery was 2019 NAIP three-band (RGB) imagery at 0.6 m, retrieved through Google Earth Engine (`USDA/NAIP/DOQQ`) directly onto a 0.6 m grid in NAD83(2011) / UTM Zone 10N whose origin coincides with the 1 m CHM grid, so that imagery and LiDAR products share a common origin.
+
+**Reference crowns**
+
+Reference trees were segmented from the 1 m pit-free CHM. The CHM was smoothed with a Gaussian filter ($\sigma$ = 1 cell) to suppress spurious peaks, and treetops were identified as local maxima at least 2 m tall using a variable-window filter in the style of [Popescu and Wynne (2004)](https://doi.org/10.14358/PERS.70.5.589): candidate maxima were accepted in order of decreasing height, and each accepted treetop suppressed shorter maxima within a search radius of $1.2 + 0.15h$ m, where $h$ is its height. Crowns were then delineated by marker-controlled watershed segmentation of the inverted smoothed CHM, restricted to cells taller than 2 m ([van der Walt et al. 2014](https://doi.org/10.7717/peerj.453)). Segmentation produced 239,961 crowns, of which 202,730 belonged to trees at least 5 m tall; shorter trees were excluded as barely resolvable at 0.6 m. Because DeepForest predicts rectangles, each crown's bounding rectangle was used as its training box.
+
+**Tiles and spatial cross-validation**
+
+The 1 km LiDAR delivery tiles were reconstructed from their file names, which encode each tile's south-west corner, and trimmed to the NAIP extent. Tiles containing fewer than 200 reference crowns, which were slivers at the survey edge, were excluded, leaving 40 tiles with 202,242 crowns (@fig-folds). Wherever the CHM had no data, NAIP pixels were set to zero before training and prediction; trees in those areas have no reference crowns and would otherwise be presented to the model as background.
+
+Model performance was assessed with five-fold spatial cross-validation in which whole tiles were held out, because neighboring crowns share stand conditions and image characteristics, and random splits of spatially structured data overstate predictive performance ([Roberts et al. 2017](https://doi.org/10.1111/ecog.02881); [Ploton et al. 2020](https://doi.org/10.1038/s41467-020-18321-y)). Holding out individual crowns was not an option in any case: a detector is trained on image patches in which every unlabeled tree is treated as background. Tiles were sorted by mean rumple and assigned to folds in rotation, so that each fold spanned the full range of canopy complexity. For each fold, its 8 tiles (20%) were the test tiles, 4 tiles (10%) from another fold were used as validation tiles to select the training epoch, and the remaining 28 tiles (70%) were used for training. Every tile was therefore a test tile exactly once, scored by a model that had not seen it.
+
+```{python}
+#| echo: false
+#| label: fig-folds
+#| fig-cap: "The 40 LiDAR tiles over 2019 NAIP imagery. Each tile is labeled with the cross-validation fold in which it was a test tile; folds were assigned in rotation after sorting tiles by mean rumple. Black areas have no LiDAR coverage."
+if naip_path.exists() and folds_path.exists():
+    folds = gpd.read_file(folds_path)
+    with rasterio.open(naip_path) as s:
+        scale = max(1, int(max(s.width, s.height) / 1600))
+        rgb = s.read([1, 2, 3], out_shape=(3, s.height // scale, s.width // scale), resampling=Resampling.average)
+        b = s.bounds
+    rgb = np.moveaxis(rgb, 0, -1)
+    fig, ax = plt.subplots(figsize=(7, 12))
+    ax.imshow(rgb, extent=[b.left, b.right, b.bottom, b.top])
+    folds.boundary.plot(ax=ax, color="white", linewidth=1)
+    for t in folds.itertuples():
+        c = t.geometry.centroid
+        txt = ax.text(c.x, c.y, str(t.fold), ha="center", va="center", fontsize=10, color="white", weight="bold")
+        txt.set_path_effects([pe.withStroke(linewidth=2.5, foreground="black")])
+    span = b.right - b.left
+    xa, ya = b.left + 0.06 * span, b.bottom + 0.03 * (b.top - b.bottom)
+    ax.plot([xa, xa + 2000], [ya, ya], color="white", linewidth=5, solid_capstyle="butt")
+    ax.plot([xa, xa + 2000], [ya, ya], color="black", linewidth=2, solid_capstyle="butt")
+    txt = ax.text(xa + 1000, ya + 0.01 * (b.top - b.bottom), "2 km", ha="center", va="bottom", color="white")
+    txt.set_path_effects([pe.withStroke(linewidth=2, foreground="black")])
+    ax.set_xlim(b.left, b.right); ax.set_ylim(b.bottom, b.top); ax.set_axis_off()
+    plt.show()
+else:
+    print("Inputs not found; run 02_prepare_training_data.py first.")
+```
+
+**Detector training**
+
+Models were trained with DeepForest 2.1.0 ([Weinstein et al. 2020](https://doi.org/10.1111/2041-210X.13472)), which implements RetinaNet with a ResNet-50 backbone ([Lin et al. 2017](https://openaccess.thecvf.com/content_iccv_2017/html/Lin_Focal_Loss_for_ICCV_2017_paper.html)), starting from the released tree model (`weecology/deepforest-tree`). Each tile was cut into 200 × 200 pixel patches (120 m) with 10% overlap; DeepForest enlarges each patch to 800 pixels internally. Boxes cut by a patch edge were kept only if more than half of their area remained in the patch. Models were trained for 10 epochs with stochastic gradient descent (learning rate 0.001, momentum 0.9, batch size 2), random horizontal flips, and gradient clipping at a norm of 1.0, added after the loss diverged to NaN partway through an early training run. For each fold, the model from the epoch with the highest validation accuracy was retained. Validation accuracy was quantified as mean average precision, the standard performance metric for object detectors, which summarizes the precision of predicted boxes across all levels of recall ([Everingham et al. 2010](https://doi.org/10.1007/s11263-009-0275-4)). The non-maximum suppression threshold, the overlap above which a lower-scoring box is discarded, was raised from DeepForest's default of 0.05 to 0.3, because most reference boxes in this closed canopy overlap a neighbor by more than 0.05.
+
+**Prediction and accuracy assessment**
+
+Each test tile was predicted whole, in 200-pixel patches with 10% overlap; where boxes from overlapping patches had an intersection over union (IoU; defined below) above 0.3, only the higher-scoring box was kept, and predictions with a confidence score below 0.1 were discarded. Only reference trees and predictions at least 10 m inside the tile edge and on LiDAR data were scored. The released DeepForest model served as the baseline, with the same post-processing. Because it was developed on much finer imagery, its patch size was chosen separately for each fold from 100, 200, and 400 pixels using that fold's validation tiles, and only then applied to the fold's test tiles.
+
+Predictions were then matched to reference trees. A predicted box rarely coincides exactly with a reference crown, because predictions are rectangles and watershed crowns are irregular polygons: a box can cover the right tree but be offset from the crown, larger or smaller than it, or a different shape. Whether such a prediction counts as a detection depends on how closely the two are required to agree, and studies differ in this requirement ([Yin and Wang 2016](https://doi.org/10.1080/01431161.2016.1214302)). Five matching criteria were therefore applied.
+
+First, a prediction was matched to a reference tree when the intersection over union (IoU) of the predicted box and the bounding rectangle of the reference crown was at least 0.5; IoU is the area the two rectangles share divided by the total area they cover together. This is the standard criterion in object detection, where the threshold was "set deliberately low to account for inaccuracies in bounding boxes in the ground truth data" ([Everingham et al. 2010](https://doi.org/10.1007/s11263-009-0275-4)), and it is also used to assess tree crown delineation ([Lin et al. 2024](https://www.mdpi.com/2072-4292/16/21/3920)). Second, a prediction was matched when the IoU was at least 0.4, the default in DeepForest, which its developers chose based on visual evaluation ([Weecology n.d.](https://deepforest.readthedocs.io/en/v2.1.0/_sources/user_guide/12_evaluation.md.txt)). Third, a prediction was matched when the reference treetop fell within the predicted box (treetop-in-box). This is the LiDAR counterpart of the field-stem recall of [Weinstein et al. (2021)](https://doi.org/10.7554/eLife.62922), in which a field-mapped stem counts as detected when it falls within a predicted box. Fourth, a prediction was matched when the IoU was at least 0.5 and the reference treetop also fell within the predicted box. Fifth, a prediction was matched when the IoU was at least 0.4 and the reference treetop also fell within the predicted box. The fourth and fifth criteria, which require both that the box fit the crown and that it contain the treetop, were introduced for this study; no published precedent for combining the two requirements was found.
+
+Under any of these criteria, predictions and reference trees do not always pair off cleanly, because predicted boxes overlap one another and vary in size. A large box can enclose the treetops of several neighboring trees, and a single treetop can lie within two or more overlapping boxes. If every such case were counted as a match, one box could be credited with detecting several trees, and one tree could make several boxes count as correct. Matching was therefore one-to-one: each prediction was matched to no more than one reference tree, and each reference tree to no more than one prediction, as [Weinstein et al. (2021)](https://doi.org/10.7554/eLife.62922) allowed each field stem to count toward only one prediction. Predictions were considered in order of decreasing confidence, so that when several predictions qualified for the same tree, the tree was assigned to the most confident of them. A prediction that qualified for several trees was matched to the unmatched tree it fit best: the one with the highest IoU or, under treetop-in-box, the treetop nearest the centre of the box. Predictions left unmatched were counted as false positives, and reference trees left unmatched as missed.
+
+Treetop-in-box was used as the primary criterion for the analyses of canopy complexity, because it records whether a tree was found regardless of how closely a rectangle fits an irregular watershed crown. It differs from the field-stem recall of Weinstein et al. (2021) in two respects: the reference points are treetops derived from the same LiDAR canopy height model as the training labels rather than independently measured stems, and the criterion was used to estimate precision as well as recall, which assumes that every tree visible in the imagery has a reference crown. Accuracy was summarized as precision, the proportion of predictions that were matched to a reference tree; recall, the proportion of reference trees that were matched to a prediction; and F1, the harmonic mean of the two. These were calculated from the test tiles of all five folds combined, so that every reference tree was counted once, and separately for each fold.
+
+**Canopy complexity and detection**
+
+Each reference tree was assigned the rumple value of the 30 m cell containing its treetop, along with its crown area and height. Canopy position was classified with three classes adapted from the neighborhood classes of [Kaartinen et al. (2012)](https://doi.org/10.3390/rs4040950), who assigned reference trees to four classes manually: from the tallest watershed crown sharing a boundary with each crown, trees were classed as tallest in their neighborhood or isolated, similar to their neighbors (at least 75% of the tallest neighbor's height, a cut-off chosen for this study), or next to a much taller tree. Trees were divided into five rumple bins containing equal numbers of trees.
+
+Detection was then related to rumple in four steps. First, overall precision, recall, and F1 were calculated for each rumple bin and each tile, and tile-level recall was regressed on tile mean rumple, analogous to the plot-level analysis of [Hastings et al. (2020)](https://doi.org/10.3390/rs12020309). The same regression was fit across 30 m cells with at least five trees, with and without the cell's mean log crown area. Second, recall was tabulated by crown-area class and rumple bin, reporting accuracy by stratum, which [Yin and Wang (2016)](https://doi.org/10.1080/01431161.2016.1214302) identify as a key factor in accuracy assessment. Third, whether each tree was found (1) or missed (0) was modeled with logistic regression following [Hastings et al. (2020)](https://doi.org/10.3390/rs12020309). Predictors were standardized, multicollinearity was checked with variance inflation factors (VIF < 10), the model was reduced by backward elimination from a global model containing tree height, crown area, and rumple until AIC no longer decreased, and predictive performance was assessed with 10-fold cross-validation. The analysis departed from Hastings et al. in four ways. Crown area was log-transformed, because detection rose steeply for small crowns and leveled off for large ones. Tile was included as a fixed effect rather than a random intercept, which estimates the same within-tile slopes with 40 tiles and thousands of trees per tile. Standard errors were clustered by 30 m cell, because trees in the same cell are not independent. Finally, tree height and crown area came from the LiDAR, whereas Hastings et al. took tree attributes from a field stem census and from crowns delineated manually on UAV imagery. Two extensions tested whether the rumple effect differed with crown area (a rumple × crown area interaction) and whether canopy position accounted for it. Precision was modeled in the same way at the prediction level, with log box area in place of crown area.
+
+Robustness was assessed in three ways: the models were refit under each of the five matching criteria; recall in the rougher half of each tile's trees was compared with recall in the smoother half, which removes any difference between tiles such as illumination or stand type; and the fine-tuned and released models were compared in a single model fit to both models' outcomes for the same trees, with model-specific size effects and tile intercepts, in which a rumple × model interaction tests whether fine-tuning changed the rumple effect. Intervals shown in figures were estimated by resampling whole tiles 1,000 times. Models were fit with statsmodels ([Seabold and Perktold 2010](https://doi.org/10.25080/Majora-92bf1922-011)).
+
+# Results
+
+**Reference trees.** Across the 40 tiles, 194,055 reference trees lay at least 10 m inside a tile edge and on LiDAR data and were scored; 190,573 of these fell in a 30 m cell with a rumple value and were used in the rumple analysis. Among them, mean tree height was 16.4 m (median 14.9 m), median crown area was 48 m², and rumple at the trees ranged from 1.01 to 7.07 (mean 2.21, SD 0.80). Crown area and height were strongly correlated (Spearman $\rho = 0.71$), as were rumple and height ($\rho = 0.73$); rumple and crown area were moderately correlated ($\rho = 0.41$). Consequently, the mix of crown sizes changed strongly along the rumple gradient: crowns smaller than 25 m² made up 42% of trees in the smoothest fifth but 7% in the roughest. A quarter of trees (25%) were the tallest in their neighborhood or isolated, 37% were similar in height to their neighbors, and 38% were next to a much taller tree.
+
+**Training.** Of the five folds, three reached their highest validation accuracy at the tenth and final epoch, and two reached it at the ninth epoch, with a slight decline at the tenth. In every fold, the increase in validation accuracy between the seventh and tenth epochs was less than half of that between the first and fourth, indicating diminishing returns from further training. For the released model, a 200-pixel patch gave the highest validation F1 in all five folds (0.38 to 0.50, against 0.16 to 0.31 for 100 and 400 pixels).
+
+**Detection accuracy.** Fine-tuning improved detection accuracy under every matching criterion (@tbl-cv). Under treetop-in-box matching, the fine-tuned model reached a pooled F1 of 0.75 against 0.42 for the released model, with gains in both precision (0.76 against 0.48) and recall (0.74 against 0.37). The fine-tuned model was consistent across folds (F1 0.74 to 0.76), while the released model varied more (0.37 to 0.46). Under the box-overlap criteria, which also require the predicted box to fit the crown, both models scored lower and the gap between them was wider: F1 was 0.44 for the fine-tuned model and 0.06 for the released model at IoU ≥ 0.5, and 0.57 and 0.14 at IoU ≥ 0.4. Additionally requiring the treetop to fall within the box changed F1 by less than 0.01 for either model.
+
+| Matching criterion | Model | Precision | Recall | F1 | F1 across folds (mean ± SD) |
+|---|---|---:|---:|---:|---:|
+| IoU ≥ 0.5 | Released | 0.07 | 0.06 | 0.06 | 0.06 ± 0.01 |
+| | Fine-tuned | 0.45 | 0.44 | 0.44 | 0.44 ± 0.03 |
+| IoU ≥ 0.4 | Released | 0.16 | 0.12 | 0.14 | 0.14 ± 0.02 |
+| | Fine-tuned | 0.58 | 0.57 | 0.57 | 0.57 ± 0.03 |
+| Treetop-in-box | Released | 0.48 | 0.37 | 0.42 | 0.41 ± 0.03 |
+| | Fine-tuned | 0.76 | 0.74 | 0.75 | 0.75 ± 0.01 |
+| IoU ≥ 0.5 and treetop-in-box | Released | 0.07 | 0.06 | 0.06 | 0.06 ± 0.01 |
+| | Fine-tuned | 0.45 | 0.44 | 0.44 | 0.44 ± 0.03 |
+| IoU ≥ 0.4 and treetop-in-box | Released | 0.15 | 0.12 | 0.13 | 0.13 ± 0.01 |
+| | Fine-tuned | 0.57 | 0.56 | 0.57 | 0.56 ± 0.03 |
+
+: Cross-validated detection accuracy under the five matching criteria, pooling the test tiles of all five folds (194,055 reference trees). The released model used the patch size selected on each fold's validation tiles. {#tbl-cv}
+
+Gains from fine-tuning were largest for medium and large crowns (@tbl-area). The released model found fewer than 60% of even the largest crowns, while the fine-tuned model found more than 90% of crowns larger than 100 m². Both models detected few crowns smaller than 10 m². In the imagery, the released model placed fewer, larger boxes and missed many crowns that the fine-tuned model found (@fig-example).
+
+| Crown area | Trees | Released | Fine-tuned |
+|---|---:|---:|---:|
+| < 10 m² | 7,813 | 0.20 | 0.28 |
+| 10–25 m² | 33,440 | 0.24 | 0.53 |
+| 25–50 m² | 57,332 | 0.31 | 0.72 |
+| 50–100 m² | 57,831 | 0.42 | 0.84 |
+| 100–200 m² | 29,132 | 0.53 | 0.91 |
+| > 200 m² | 5,025 | 0.59 | 0.95 |
+
+: Recall (treetop-in-box) by watershed crown area. {#tbl-area}
+
+```{python}
+#| echo: false
+#| label: fig-example
+#| fig-cap: "Predictions of the released (left) and fine-tuned (right) models over a 100 m window of 2019 NAIP imagery, at the centre of the test tile closest to the median tile rumple. Thin white outlines are watershed crowns of trees at least 5 m tall; colored rectangles are predictions. Black areas have no LiDAR data and were blanked before prediction."
+tile_scores_path = cv_dir / "cv_tile_scores.csv"
+if tile_scores_path.exists():
+    ts = pd.read_csv(tile_scores_path)
+    ex = ts.iloc[(ts.rumple - ts.rumple.median()).abs().argmin()]
+    tile, fold = ex["tile"], int(ex["fold"])
+    with rasterio.open(cv_dir / "naip_tiles" / f"{tile}.tif") as s:
+        cx, cy = (s.bounds.left + s.bounds.right) / 2, (s.bounds.bottom + s.bounds.top) / 2
+        half = 50
+        win = rasterio.windows.from_bounds(cx - half, cy - half, cx + half, cy + half, s.transform)
+        img = np.moveaxis(s.read([1, 2, 3], window=win), 0, -1)
+    bbox = (cx - half, cy - half, cx + half, cy + half)
+    crowns = gpd.read_file(cv_dir / "trained" / f"fold{fold}" / "crowns_scored.shp", bbox=bbox)
+    fig, axes = plt.subplots(1, 2, figsize=(8.3, 4.4))    # both panels fit the text column (12 in ran past it)
+    for ax, name, col, label in [(axes[0], "pretrained", DL, "Released model"), (axes[1], "trained", FT, "Fine-tuned model")]:
+        pred = gpd.read_file(cv_dir / name / f"fold{fold}" / "predictions.shp", bbox=bbox)
+        ax.imshow(img, extent=[cx - half, cx + half, cy - half, cy + half])
+        crowns.boundary.plot(ax=ax, color="white", linewidth=0.5, alpha=0.8)
+        pred.boundary.plot(ax=ax, color=col, linewidth=1.2)
+        ax.set_xlim(cx - half, cx + half); ax.set_ylim(cy - half, cy + half); ax.set_axis_off()
+        ax.set_title(f"{label}: {len(pred)} predictions", loc="left", fontsize=10, color=INK)
+    fig.tight_layout(); plt.show()
+else:
+    print("Inputs not found; run 04_predict_tiles.py first.")
+```
+
+**Overall accuracy and rumple.** Averaged across all trees, the fine-tuned model's accuracy increased with rumple (@tbl-rumple), from an F1 of 0.65 in the smoothest fifth of trees to 0.80 in the roughest. Most of this increase came from recall (0.65 to 0.81); precision was lowest in the smoothest fifth (0.66) and similar elsewhere (0.77 to 0.81). Across the 40 tiles, the fine-tuned model's F1 increased with tile mean rumple (Spearman $\rho = 0.66$, $p < 0.001$; @fig-tiles), and tile-level recall increased by 0.047 per unit of rumple ($R^2 = 0.34$, $p < 0.001$). The released model showed no such trend (F1 Spearman $\rho = 0.11$, $p = 0.50$), and its precision was again lowest in the smoothest canopy (0.35, against 0.50 to 0.55 elsewhere).
+
+| Rumple (30 m cell) | Released P | R | F1 | Fine-tuned P | R | F1 |
+|---|---:|---:|---:|---:|---:|---:|
+| 1.01–1.46 (smoothest) | 0.35 | 0.36 | 0.35 | 0.66 | 0.65 | 0.65 |
+| 1.46–1.84 | 0.50 | 0.36 | 0.42 | 0.77 | 0.72 | 0.75 |
+| 1.84–2.32 | 0.52 | 0.35 | 0.42 | 0.79 | 0.76 | 0.77 |
+| 2.32–2.93 | 0.55 | 0.36 | 0.44 | 0.81 | 0.77 | 0.79 |
+| 2.93–7.07 (roughest) | 0.53 | 0.41 | 0.46 | 0.79 | 0.81 | 0.80 |
+| All | 0.48 | 0.37 | 0.42 | 0.76 | 0.74 | 0.75 |
+
+: Overall precision (P), recall (R), and F1 by rumple bin, all crown sizes together. Each bin contains about 38,100 reference trees; predictions are assigned to the bin of the 30 m cell containing their centre. {#tbl-rumple}
+
+```{python}
+#| echo: false
+#| label: fig-tiles
+#| fig-cap: "F1 (treetop-in-box) of each of the 40 test tiles against the tile's mean rumple, for the released and fine-tuned models."
+if tile_scores_path.exists():
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for name, col, label in [("pretrained", DL, "Released"), ("trained", FT, "Fine-tuned")]:
+        y = ts[f"{name}_treetop_F1"]
+        ax.scatter(ts.rumple, y, s=60, color=col, edgecolor="white", linewidth=1.2, label=label, zorder=3)
+        k = ts.rumple.idxmax()
+        ax.annotate(label, (ts.rumple[k], y[k]), xytext=(10, 0), textcoords="offset points", va="center", color=INK, fontsize=9)
+    ax.set_xlabel("Tile mean rumple", color=MUTED); ax.set_ylabel("F1 (treetop-in-box)", color=MUTED)
+    ax.set_ylim(0, 1); ax.grid(axis="y", color=GRID, linewidth=0.8); ax.set_axisbelow(True)
+    for side in ["top", "right"]:
+        ax.spines[side].set_visible(False)
+    ax.legend(frameon=False, loc="lower right")
+    plt.show()
+```
+
+**Rumple at a fixed crown size.** Within crown-size classes the relationship reversed (@fig-rumple). For the fine-tuned model, recall of crowns of 10–25 m² fell from 0.57 in the smoothest fifth to 0.44 in the roughest, and recall of crowns of 25–50 m² fell slightly, from 0.72 to 0.70, while recall of crowns larger than 50 m² remained high (0.82 to 0.96) with no consistent trend. The released model showed larger declines: from 0.29 to 0.17 for crowns of 10–25 m², from 0.38 to 0.26 for 25–50 m², and from 0.47 to 0.42 for 50–100 m². Aggregating to 30 m cells produced the same contrast; cell recall increased with rumple for both models, but once the cell's mean crown area was included the slope was near zero for the fine-tuned model ($-0.003$, $p = 0.23$) and negative for the released model ($-0.027$, $p < 0.001$).
+
+```{python}
+#| echo: false
+#| label: fig-rumple
+#| fig-cap: "Recall (left) and precision (right) by rumple bin within crown-size classes, for the fine-tuned (top) and released (bottom) models. The dashed line combines all sizes. Bars are 95% intervals from resampling whole tiles; points with fewer than 30 trees are not shown."
+from IPython.display import Image, display
+png = rumple_dir / "models_rumple_recall_precision.png"
+if png.exists():
+    display(Image(filename=str(png)))
+else:
+    print("Inputs not found; run 05_rumple_analysis.py first.")
+```
+
+In the tree-level logistic regressions (@tbl-or), VIFs were below 4 (height 3.8, log crown area 2.0, rumple 2.4), and backward elimination retained all three predictors for both models. Rumple alone was positively associated with detection (odds ratio per SD 1.33 for the fine-tuned model and 1.13 for the released model). Once crown area and height were included, the association became negative: each SD increase in rumple multiplied the odds of detection by 0.83 for the fine-tuned model and 0.81 for the released model. Crown area was the strongest predictor for both models, and much stronger for the fine-tuned model (odds ratio 2.44 per SD, against 1.56). The rumple × crown area interaction was small for the fine-tuned model (1.01, $p = 0.10$), indicating a similar rumple effect on the odds scale across crown sizes, but larger for the released model (1.11), whose rumple penalty fell mostly on small crowns. Cross-validated AUC was 0.74 for the fine-tuned model and 0.67 for the released model, against 0.58 and 0.61 for rumple alone.
+
+| Model | Term | Fine-tuned | Released |
+|---|---|---:|---:|
+| Rumple only | Rumple | 1.33 [1.31, 1.35] | 1.13 [1.11, 1.15] |
+| Global (selected) | Tree height | 1.22 [1.19, 1.26] | 1.25 [1.22, 1.28] |
+| | Log crown area | 2.44 [2.39, 2.49] | 1.56 [1.54, 1.59] |
+| | Rumple | 0.83 [0.81, 0.85] | 0.81 [0.79, 0.83] |
+| + Rumple × crown area | Interaction | 1.01 [1.00, 1.03] | 1.11 [1.10, 1.13] |
+| + Canopy position | Rumple | 0.86 [0.84, 0.89] | 0.83 [0.81, 0.84] |
+| | Similar to neighbors | 0.82 [0.79, 0.85] | 0.94 [0.92, 0.97] |
+| | Next to a much taller tree | 0.83 [0.80, 0.86] | 0.88 [0.86, 0.91] |
+| | Cross-validated AUC (global) | 0.74 | 0.67 |
+
+: Odds ratios per SD of each predictor (95% confidence intervals, standard errors clustered by 30 m cell) from tree-level logistic regressions of detection (treetop-in-box), with tile as a fixed effect. Canopy position is relative to trees that are tallest in their neighborhood or isolated. {#tbl-or}
+
+**Robustness.** The negative conditional rumple effect held under every matching criterion, with odds ratios from 0.79 to 0.84 for the fine-tuned model and 0.74 to 0.81 for the released model. Within tiles, small crowns (< 25 m²) had lower recall in the rougher half of the tile in 26 of 40 tiles for the fine-tuned model (median difference −0.03) and 30 of 40 for the released model (−0.04); for larger crowns, recall was lower in the rougher half in only 19 to 25 tiles (of 40, or of 39 for crowns of at least 100 m², which were absent from the smoother half of one tile). When both models' outcomes for the same trees were modeled together, the rumple effect did not differ between them (ratio of odds ratios, released to fine-tuned, 0.97 [0.95, 1.00], $p = 0.05$).
+
+**Canopy position.** Trees that were not the tallest in their neighborhood had lower odds of detection, by about 18% for the fine-tuned model and 6–12% for the released model (@tbl-or). Adding canopy position to the model with the rumple × crown area interaction changed the rumple odds ratio only slightly, from 0.83 to 0.86 for the fine-tuned model and from 0.80 to 0.83 for the released model.
+
+**Precision.** For the released model, precision increased with rumple at a given box size (odds ratio 1.24 [1.22, 1.26]), reflecting the many false positives it produced in smooth canopy. For the fine-tuned model, the effect depended on box size (rumple × box area interaction 1.22 [1.19, 1.24]): in rough canopy, small boxes were less often correct (precision of 10–25 m² boxes 0.59 in the smoothest fifth and 0.41 in the roughest) and the largest boxes more often correct (boxes larger than 200 m², 0.60 and 0.86). Rumple and box size explained little of the variation in precision (cross-validated AUC of the interaction models 0.66 for the fine-tuned model and 0.65 for the released model).
+
+# Discussion
+
+Fine-tuning on LiDAR-derived crowns transformed DeepForest's performance on 0.6 m NAIP imagery. The released model, developed on 10 cm imagery, found about a third of reference trees and missed roughly 40% of even the largest crowns, while the fine-tuned model found three quarters of trees and more than 90% of crowns larger than 100 m², with an F1 that varied by only ±0.01 across folds. This extends the use of LiDAR-derived crowns as training labels ([Weinstein et al. 2019](https://doi.org/10.3390/rs11111309)) from pretraining at fine resolution to direct supervision at NAIP resolution, without any new hand annotation. The gap between treetop-in-box and box-overlap accuracy (F1 0.75, against 0.44 at IoU ≥ 0.5 and 0.57 at IoU ≥ 0.4) also shows how much reported accuracy depends on the matching criterion ([Yin and Wang 2016](https://doi.org/10.1080/01431161.2016.1214302)). Watershed crowns are irregular, so a correctly placed rectangle often overlaps the reference rectangle by less than these thresholds; reporting several criteria makes results comparable with both point-based and overlap-based studies.
+
+The relationship between canopy complexity and detection depended on whether crown size was accounted for. Averaged across trees, tiles, or cells, the fine-tuned model was more accurate in rough canopy, and across tiles this trend was strong. Within crown-size classes and in tree-level models, however, rough canopy made trees of a given size harder to detect. This reversal is an instance of Simpson's paradox ([Simpson 1951](https://www.jstor.org/stable/2984065)): rough canopy contains a larger share of big crowns, which are easy to detect, so the aggregate trend reflects the mix of crown sizes rather than the effect of complexity. It is consistent with rumple's dependence on tree height ([Kane et al. 2010b](https://doi.org/10.1139/X10-064)), and with LiDAR detection studies in which tree size and dominance governed whether trees were found ([Kaartinen et al. 2012](https://doi.org/10.3390/rs4040950); [Eysn et al. 2015](https://doi.org/10.3390/f6051721)). The conditional effect matches the direction of the rumple effect in the tree-level models of [Hastings et al. (2020)](https://doi.org/10.3390/rs12020309), here estimated with 190,573 trees rather than 15 plots. For the released model, the two effects nearly cancelled, leaving recall almost flat across rumple bins and no trend in F1 across tiles. In practice, an analysis that relates detection accuracy to a canopy-structure variable without accounting for crown size could report the opposite of the conditional relationship.
+
+The conditional rumple penalty was similar for both models, so fine-tuning raised accuracy everywhere without making the detector less sensitive to canopy complexity. Several mechanisms could cause the penalty. At 0.6 m, small crowns between tall trees are often shaded, and the crowns of tall neighbors, displaced outward by relief displacement, can cover them in the imagery. Canopy position, which approximates such neighborhoods, explained little of the effect (the rumple odds ratio moved from 0.83 to 0.86), but it is a coarse descriptor of shading and occlusion. Alternatively, part of the penalty may lie in the reference crowns rather than the detector: watershed segmentation of large, irregular crowns in complex canopy can split off branches as small spurious crowns, which no detector should find. The within-tile comparison, in which small crowns were less often detected in the rougher half of 26 of 40 tiles, shows that the effect is consistent but not universal across the landscape.
+
+The precision results point to a different change. The released model's precision was lowest in the smoothest canopy, where it produced many false positives; fine-tuning reduced but did not remove that pattern (precision in the smoothest fifth 0.66, against 0.77 to 0.81 elsewhere). For the fine-tuned model, small predicted boxes in rough canopy were more often wrong, which would be expected if it sometimes splits large, irregular crowns into several boxes, the image-based counterpart of over-segmentation in the reference crowns.
+
+Several limitations constrain interpretation. The reference trees were derived from LiDAR rather than measured in the field or digitized; therefore, errors in the LiDAR-derived tree crown identification introduced an unknown amount of error. The LiDAR was collected between October 2019 and August 2020, and the NAIP imagery was from 2019, so disturbance between acquisitions could produce small mismatches. Training was limited to ten epochs. Because gains in validation accuracy were diminishing by the final epochs, longer training would be expected to improve the fine-tuned model’s accuracy only slightly. As the released model was used without further training, and the difference between the two models was large (F1 0.75 against 0.42), longer training is unlikely to alter the comparison between them. Each tree's rumple value includes the canopy surface of its own crown, which links rumple and crown size beyond their ecological association. Finally, standard errors were clustered by 30 m cell, which does not capture spatial dependence at larger scales; with 190,573 trees, almost every effect is statistically significant, and the interpretation therefore rests on effect sizes and on their consistency across matching criteria and tiles rather than on $p$-values.
+
+Overall, LiDAR-derived crowns can supervise individual tree detection at NAIP resolution, nearly doubling the F1 of the released DeepForest model in a closed conifer landscape. Detection accuracy appeared to increase with canopy surface complexity, but only because complex canopy contains larger trees; at a given crown size, complexity reduced the chance of detection for both the released and fine-tuned models. Accuracy assessments that relate detection to canopy structure should therefore account for tree size before interpreting structural effects.
+
+# References {.unnumbered}
+
+Ball, J. G. C., Hickman, S. H. M., Jackson, T. D., Koay, X. J., Hirst, J., Jay, W., Archer, M., Aubry-Kientz, M., Vincent, G., & Coomes, D. A. (2023). Accurate delineation of individual tree crowns in tropical forests from aerial RGB imagery using Mask R-CNN. *Remote Sensing in Ecology and Conservation, 9*(5), 641–655. [https://doi.org/10.1002/rse2.332](https://doi.org/10.1002/rse2.332)
+
+Everingham, M., Van Gool, L., Williams, C. K. I., Winn, J., & Zisserman, A. (2010). The PASCAL Visual Object Classes (VOC) Challenge. *International Journal of Computer Vision, 88*(2), 303–338. [https://doi.org/10.1007/s11263-009-0275-4](https://doi.org/10.1007/s11263-009-0275-4)
+
+Eysn, L., Hollaus, M., Lindberg, E., Berger, F., Monnet, J.-M., Dalponte, M., Kobal, M., Pellegrini, M., Lingua, E., Mongus, D., & Pfeifer, N. (2015). A benchmark of lidar-based single tree detection methods using heterogeneous forest data from the Alpine Space. *Forests, 6*(5), 1721–1747. [https://doi.org/10.3390/f6051721](https://doi.org/10.3390/f6051721)
+
+Hastings, J. H., Ollinger, S. V., Ouimette, A. P., Sanders-DeMott, R., Palace, M. W., Ducey, M. J., Sullivan, F. B., Basler, D., & Orwig, D. A. (2020). Tree species traits determine the success of LiDAR-based crown mapping in a mixed temperate forest. *Remote Sensing, 12*(2), 309. [https://doi.org/10.3390/rs12020309](https://doi.org/10.3390/rs12020309)
+
+Jeronimo, S. (2015). *LiDAR individual tree detection for assessing structurally diverse forest landscapes* [Master's thesis, University of Washington]. [ResearchWorks](https://digital.lib.washington.edu/researchworks/items/99a462fb-9bee-4896-b8c6-d47a65779990)
+
+Kaartinen, H., Hyyppä, J., Yu, X., Vastaranta, M., Hyyppä, H., Kukko, A., Holopainen, M., Heipke, C., Hirschmugl, M., Morsdorf, F., Næsset, E., Pitkänen, J., Popescu, S., Solberg, S., Wolf, B. M., & Wu, J.-C. (2012). An international comparison of individual tree detection and extraction using airborne laser scanning. *Remote Sensing, 4*(4), 950–974. [https://doi.org/10.3390/rs4040950](https://doi.org/10.3390/rs4040950)
+
+Kane, V. R., McGaughey, R. J., Bakker, J. D., Gersonde, R. F., Lutz, J. A., & Franklin, J. F. (2010a). Comparisons between field- and LiDAR-based measures of stand structural complexity. *Canadian Journal of Forest Research, 40*, 761–773. [https://doi.org/10.1139/X10-024](https://doi.org/10.1139/X10-024)
+
+Kane, V. R., Bakker, J. D., McGaughey, R. J., Lutz, J. A., Gersonde, R. F., & Franklin, J. F. (2010b). Examining conifer canopy structural complexity across forest ages and elevations with LiDAR data. *Canadian Journal of Forest Research, 40*, 774–787. [https://doi.org/10.1139/X10-064](https://doi.org/10.1139/X10-064)
+
+Khosravipour, A., Skidmore, A. K., Isenburg, M., Wang, T., & Hussin, Y. A. (2014). Generating pit-free canopy height models from airborne lidar. *Photogrammetric Engineering & Remote Sensing, 80*, 863–872. [https://doi.org/10.14358/PERS.80.9.863](https://doi.org/10.14358/PERS.80.9.863)
+
+Lin, T.-Y., Goyal, P., Girshick, R., He, K., & Dollár, P. (2017). Focal loss for dense object detection. In *Proceedings of the IEEE International Conference on Computer Vision (ICCV)* (pp. 2980–2988). [CVF Open Access](https://openaccess.thecvf.com/content_iccv_2017/html/Lin_Focal_Loss_for_ICCV_2017_paper.html)
+
+Lin, Y., Li, H., Jing, L., Ding, H., & Tian, S. (2024). Individual tree crown delineation using airborne LiDAR data and aerial imagery in the taiga–tundra ecotone. *Remote Sensing, 16*(21), 3920. [MDPI](https://www.mdpi.com/2072-4292/16/21/3920)
+
+Parker, G. G., Harmon, M. E., Lefsky, M. A., Chen, J., Van Pelt, R., Weis, S. B., Thomas, S. C., Winner, W. E., Shaw, D. C., & Franklin, J. F. (2004). Three-dimensional structure of an old-growth *Pseudotsuga-Tsuga* canopy and its implications for radiation balance, microclimate, and gas exchange. *Ecosystems, 7*, 440–453. [https://doi.org/10.1007/s10021-004-0136-5](https://doi.org/10.1007/s10021-004-0136-5)
+
+Ploton, P., Mortier, F., Réjou-Méchain, M., Barbier, N., Picard, N., Rossi, V., Dormann, C., Cornu, G., Viennois, G., Bayol, N., Lyapustin, A., Gourlet-Fleury, S., & Pélissier, R. (2020). Spatial validation reveals poor predictive performance of large-scale ecological mapping models. *Nature Communications, 11*, 4540. [https://doi.org/10.1038/s41467-020-18321-y](https://doi.org/10.1038/s41467-020-18321-y)
+
+Popescu, S. C., & Wynne, R. H. (2004). Seeing the trees in the forest: Using lidar and multispectral data fusion with local filtering and variable window size for estimating tree height. *Photogrammetric Engineering & Remote Sensing, 70*(5), 589–604. [https://doi.org/10.14358/PERS.70.5.589](https://doi.org/10.14358/PERS.70.5.589)
+
+Roberts, D. R., Bahn, V., Ciuti, S., Boyce, M. S., Elith, J., Guillera-Arroita, G., Hauenstein, S., Lahoz-Monfort, J. J., Schröder, B., Thuiller, W., Warton, D. I., Wintle, B. A., Hartig, F., & Dormann, C. F. (2017). Cross-validation strategies for data with temporal, spatial, hierarchical, or phylogenetic structure. *Ecography, 40*(8), 913–929. [https://doi.org/10.1111/ecog.02881](https://doi.org/10.1111/ecog.02881)
+
+Seabold, S., & Perktold, J. (2010). Statsmodels: Econometric and statistical modeling with Python. In *Proceedings of the 9th Python in Science Conference* (pp. 92–96). [https://doi.org/10.25080/Majora-92bf1922-011](https://doi.org/10.25080/Majora-92bf1922-011)
+
+Simpson, E. H. (1951). The interpretation of interaction in contingency tables. *Journal of the Royal Statistical Society, Series B (Methodological), 13*(2), 238–241. [JSTOR](https://www.jstor.org/stable/2984065)
+
+U.S. Department of Agriculture, Farm Production and Conservation Business Center. (n.d.). *National Agriculture Imagery Program (NAIP) imagery* [Data set]. [Data.gov](https://catalog.data.gov/dataset/national-agriculture-imagery-program-naip-imagery)
+
+U.S. Geological Survey. (2022). *WA Eastern Cascades 2019 B19 project report*. [Project report](https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/metadata/WA_EasternCascades_2019_B19/USGS_WA_EasternCascades_2019_B19_Project_Report.pdf)
+
+van der Walt, S., Schönberger, J. L., Nunez-Iglesias, J., Boulogne, F., Warner, J. D., Yager, N., Gouillart, E., Yu, T., & the scikit-image contributors. (2014). scikit-image: Image processing in Python. *PeerJ, 2*, e453. [https://doi.org/10.7717/peerj.453](https://doi.org/10.7717/peerj.453)
+
+Vauhkonen, J., Ene, L., Gupta, S., Heinzel, J., Holmgren, J., Pitkänen, J., Solberg, S., Wang, Y., Weinacker, H., Hauglin, K. M., Lien, V., Packalén, P., Gobakken, T., Koch, B., Næsset, E., Tokola, T., & Maltamo, M. (2012). Comparative testing of single-tree detection algorithms under different types of forest. *Forestry, 85*(1), 27–40. [https://doi.org/10.1093/forestry/cpr051](https://doi.org/10.1093/forestry/cpr051)
+
+Ventura, J., Pawlak, C., Honsberger, M., Gonsalves, C., Rice, J., Love, N. L. R., Han, S., Nguyen, V., Sugano, K., Doremus, J., Fricker, G. A., Yost, J., & Ritter, M. (2024). Individual tree detection in large-scale urban environments using high-resolution multispectral imagery. *International Journal of Applied Earth Observation and Geoinformation, 130*, 103848. [https://doi.org/10.1016/j.jag.2024.103848](https://doi.org/10.1016/j.jag.2024.103848)
+
+Weecology. (n.d.). *Evaluation* [DeepForest 2.1.0 documentation]. [Read the Docs](https://deepforest.readthedocs.io/en/v2.1.0/_sources/user_guide/12_evaluation.md.txt)
+
+Weinstein, B. G., Marconi, S., Bohlman, S., Zare, A., & White, E. (2019). Individual tree-crown detection in RGB imagery using semi-supervised deep learning neural networks. *Remote Sensing, 11*(11), 1309. [https://doi.org/10.3390/rs11111309](https://doi.org/10.3390/rs11111309)
+
+Weinstein, B. G., Marconi, S., Aubry-Kientz, M., Vincent, G., Senyondo, H., & White, E. P. (2020). DeepForest: A Python package for RGB deep learning tree crown delineation. *Methods in Ecology and Evolution, 11*(12), 1743–1751. [https://doi.org/10.1111/2041-210X.13472](https://doi.org/10.1111/2041-210X.13472)
+
+Weinstein, B. G., Marconi, S., Bohlman, S. A., Zare, A., Singh, A., Graves, S. J., & White, E. P. (2021). A remote sensing derived data set of 100 million individual tree crowns for the National Ecological Observatory Network. *eLife, 10*, e62922. [https://doi.org/10.7554/eLife.62922](https://doi.org/10.7554/eLife.62922)
+
+Yin, D., & Wang, L. (2016). How to assess the accuracy of the individual tree-based forest inventory derived from remotely sensed data: A review. *International Journal of Remote Sensing, 37*(19), 4521–4553. [https://doi.org/10.1080/01431161.2016.1214302](https://doi.org/10.1080/01431161.2016.1214302)
