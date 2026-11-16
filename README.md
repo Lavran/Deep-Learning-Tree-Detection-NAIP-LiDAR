@@ -4,12 +4,12 @@ Individual tree detection in 0.6 m NAIP imagery with
 [DeepForest](https://deepforest.readthedocs.io/), fine-tuned on tree crowns segmented
 from airborne LiDAR instead of hand-drawn labels. The fine-tuned model is compared with
 the released DeepForest model by five-fold spatial cross-validation across 40
-one-kilometre LiDAR tiles in eastern Mount Rainier National Park (194,055 reference
+one-kilometer LiDAR tiles in eastern Mount Rainier National Park (194,055 reference
 trees), and detection is related to canopy surface complexity (rumple) at a fixed crown
 size.
 
-**Manuscript:** [Fine-tuning-DeepForest-with-LiDAR-crowns.html](Fine-tuning-DeepForest-with-LiDAR-crowns/Fine-tuning-DeepForest-with-LiDAR-crowns.html)
-(source: `Fine-tuning-DeepForest-with-LiDAR-crowns.qmd`, in the same folder)
+**Manuscript:** [Fine-tuning-DeepForest-with-LiDAR-crowns.html](Fine-tuning-DeepForest-with-LiDAR-crowns.html)
+(source: `Fine-tuning-DeepForest-with-LiDAR-crowns.qmd`)
 
 ## Main results
 
@@ -24,8 +24,7 @@ size.
 
 ## Pipeline
 
-Run the scripts in numeric order. Each script sets its input and output paths near the
-top.
+Run the scripts in numeric order. All paths are set in `config.py`.
 
 | Script | What it does |
 |---|---|
@@ -36,15 +35,15 @@ top.
 | `04_predict_tiles.py` | Predicts each fold's test tiles with its fine-tuned model and with the released model, matches predictions to reference trees under five criteria, and writes precision, recall and F1 |
 | `05_rumple_analysis.py` | Relates detection to rumple: accuracy by rumple bin and by tile, recall by crown size, tree-level logistic regressions, robustness checks and the figures |
 
-Each script sets its working folder with `os.chdir(...)` near the top, pointing at the
-author's project folder: change that line to the folder where you cloned the
-repository. `00` and `01` write to their own output folders; the later steps read the
-NAIP mosaic from `Rainier_NAIP_2019/` and the crowns from `watershed_outputs/`, so point
-those two outputs there.
+`config.py` takes the project folder to be the folder it sits in, so the scripts run
+wherever the repository is cloned, with no path to edit: put the data in the folders it
+names, or change the paths there to point at your own copies. `00` also needs your own
+Google Earth Engine project ID, set in the same file.
 
 `03` and `04` skip folds that are already finished, so they can be stopped and
 restarted; set `redo = True` to run everything again. To rebuild the manuscript, run
-`quarto render` on the `.qmd`; it reads the NAIP mosaic and the outputs of 02, 04 and 05.
+`quarto render Fine-tuning-DeepForest-with-LiDAR-crowns.qmd`; it reads the NAIP mosaic
+and the outputs of 02, 04 and 05.
 
 ## Outputs
 
@@ -58,11 +57,17 @@ restarted; set `redo = True` to run everything again. To rebuild the manuscript,
 
 ## Setup
 
-The scripts were run in a conda environment with Python 3.12 and DeepForest 2.1.0 (which
-installs PyTorch and PyTorch Lightning), plus geopandas, rasterio, shapely 2,
-scikit-image, scipy, statsmodels and matplotlib. `00_download_naip.py` also needs
-`earthengine-api`, `geemap` and a Google Earth Engine project, set in its
-`ee.Initialize(...)` line. Fine-tuning (03) was run on a GPU.
+```
+conda env create -f environment.yml
+conda activate tree-detection
+```
+
+The environment pins the package versions the results were produced with (Python 3.12,
+DeepForest 2.1.0, PyTorch 2.9.1). conda-forge installs the GPU build of PyTorch on a
+machine with an NVIDIA driver and the CPU build otherwise; fine-tuning (03) was run on a
+GPU. The environment solves on 64-bit Windows and Linux, but not on Apple-silicon Macs,
+where conda-forge lacks one of DeepForest's dependencies. `00_download_naip.py` also
+needs a Google Earth Engine account.
 
 ## Data
 
@@ -74,7 +79,7 @@ scikit-image, scipy, statsmodels and matplotlib. `00_download_naip.py` also need
   rumple raster are built by the companion repository,
   [LiDAR-Canopy-Surface-Complexity-ICAR](https://github.com/Lavran/LiDAR-Canopy-Surface-Complexity-ICAR)
   (its steps 01, 04 and 05). This pipeline reads them from `Rainier_lidar_2019/`, under
-  the same folder names as that repository.
+  the same folder names as that repository (see `config.py`).
 
 The imagery, LiDAR products, training patches, model checkpoints (3.6 GB) and
 prediction shapefiles are too large for the repo; the scripts regenerate them. The repo
@@ -89,3 +94,8 @@ them, will differ slightly from those in the manuscript. In the author's run, fo
 reused the checkpoint of an earlier run with the same tiles and settings; on a fresh
 clone, 03 trains all five folds. Given the same models, 05 reproduces its tables and
 figures: its cross-validation, bootstrap intervals and samples use a fixed seed (0).
+
+## License
+
+MIT (see `LICENSE`). © 2026 Lavran Pagano.
+
