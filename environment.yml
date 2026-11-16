@@ -1,0 +1,49 @@
+# Conda environment for the tree-detection pipeline (scripts 00-05) and its write-up.
+# Build:   conda env create -f environment.yml
+# Use:     conda activate tree-detection
+#
+# The pinned versions are the ones the results in the manuscript were produced with, on
+# Windows with Python 3.12. To follow newer releases instead, drop the "=version" part
+# of a line.
+#
+# NOTE on PyTorch: conda-forge installs the GPU (CUDA) build of pytorch on a machine with
+# an NVIDIA driver and the CPU build otherwise. The models in the manuscript were trained
+# with the CUDA 12.8 build. The environment solves on 64-bit Windows and Linux; on
+# Apple-silicon Macs conda-forge has no build of faster-coco-eval, which DeepForest 2.1.0
+# needs, so it cannot be created there as written.
+
+name: tree-detection
+
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.12
+
+  # --- tree detector ---
+  - deepforest=2.1.0           # RetinaNet tree detector (02, 03, 04)
+  - pytorch=2.9.1
+  - torchvision=0.25.0
+  - pytorch-lightning=2.6.5    # training loop, checkpoints and logs (03)
+
+  # --- core scientific stack ---
+  - numpy=1.26.4
+  - pandas=3.0.5
+  - scipy=1.17.1
+  - scikit-image=0.26.0        # marker-controlled watershed (01)
+  - statsmodels=0.14.6         # logistic regressions (05)
+  - matplotlib=3.10.9
+
+  # --- geospatial ---
+  - geopandas=1.1.4
+  - rasterio=1.4.4
+  - shapely=2.1.2              # 2.x is required: 04 uses its vectorized functions
+
+  # --- NAIP download from Google Earth Engine (00 only) ---
+  - earthengine-api=1.7.37
+  - geemap=0.38.3
+  - geedim=2.0.0               # used by geemap.download_ee_image
+
+  # --- write-up rendering ---
+  - jupyter                    # Quarto's Python execution engine
+  - quarto                     # the Quarto CLI itself (renders the .qmd)
